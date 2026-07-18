@@ -1,0 +1,43 @@
+name: Vercel Deployment Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: main
+    permissions:
+      contents: read
+    env:
+      CI: false
+
+    steps:
+      - name: Trigger Vercel Production Deployment
+        run: |
+          RESPONSE=$(curl -s -o /tmp/vercel_response.json -w "%{http_code}" \
+            -X POST https://api.vercel.com/v13/deployments \
+            -H "Authorization: Bearer ${{ secrets.VERCEL_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "name": "your-project-name",
+              "target": "production",
+              "gitSource": {
+                "type": "github",
+                "repoId": "Put your repo ID here",
+                "ref": "main"
+              }
+            }')
+          if [ "$RESPONSE" != "200" ] && [ "$RESPONSE" != "201" ]; then
+            echo "❌ Deployment failed with status $RESPONSE"
+            cat /tmp/vercel_response.json
+            exit 1
+          fi
+          echo "✅ Deployment triggered successfully"
+          cat /tmp/vercel_response.json
+      - name: Extract Deployment URL
+        run: |
+          URL=$(cat /tmp/vercel_response.json | python3 -c "import sys,json; print(json.load(sys.stdin).get('url','N/A'))")
+          echo "🚀 Deployed to: https://$URL"
