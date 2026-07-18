@@ -1,0 +1,113 @@
+name: CI/CD Pipeline to AWS VM
+
+on:
+  push:
+    branches: [main]
+
+# This workflow is a generic CI/CD template for building a Docker image, pushing it to a registry, and deploying it to an AWS VM.
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: main
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to Docker registry
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and Push Docker image
+        run: |
+          SHORT_SHA=${GITHUB_SHA::7}
+          IMAGE=${{ secrets.DOCKER_REPOSITORY }}:project-name-$SHORT_SHA
+          echo "🔧 Building image: $IMAGE"
+          docker build --build-arg DB_URL=${{ secrets.DB_URL }} -t $IMAGE .
+          SIZE_MB=$(docker image inspect $IMAGE --format='{{.Size}}' | awk '{printf "%.1f", $1/1024/1024}')
+          echo "📦 $IMAGE — ${SIZE_MB} MB"
+          echo "📤 Pushing image to Docker Hub..."
+          docker push $IMAGE
+
+      - name: SSH and Deploy on AWS VM
+        uses: appleboy/ssh-action@v1.0.0
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          GITHUB_SHA: ${{ github.sha }}
+        with:
+          host: ${{ secrets.AWS_VM_HOST }}
+          username: ${{ secrets.AWS_VM_USERNAME }}
+          key: ${{ secrets.AWS_VM_SSH_KEY }}
+          envs: DOCKER_USERNAME,DOCKER_PASSWORD,GITHUB_SHA
+          script: |
+            set -e
+            set -x
+
+            # Debugging lines (optional, remove after confirming fix)
+            echo "DEBUG (remote): GITHUB_SHA is: $GITHUB_SHA"
+
+            SHORT_SHA=${GITHUB_SHA::7}
+            IMAGE=${{ secrets.DOCKER_REPOSITORY }}:project-name-$SHORT_SHA
+
+            echo "DEBUG (remote): SHORT_SHA is: $SHORT_SHA"
+            echo "DEBUG (remote): IMAGE is: $IMAGE"
+            echo "🔑 Logging in to Docker registry..."
+            echo "$DOCKER_PASSWORD" | sudo docker login -u "$DOCKER_USERNAME" --password-stdin
+
+            echo "📥 Pulling image: $IMAGE"
+            sudo docker pull $IMAGE
+
+            echo "🛑 Stopping and removing existing container (if any)..."
+            sudo docker stop project-name-container 2>/dev/null || true
+            sudo docker rm project-name-container 2>/dev/null || true
+
+            echo "🧹 Checking for any other services on port 5000..."
+            USED=$(sudo lsof -i :5000 -t || sudo docker ps --filter "publish=5000" -q)
+            if [ -n "$USED" ]; then
+              echo "⚠️ Port 5000 is in use. Stopping conflicting container(s)..."
+              sudo docker stop $USED || true
+              sudo docker rm $USED || true
+            fi
+
+            echo "🚀 Running new container from image: $IMAGE"
+              
+            sudo docker run -d \
+              --restart always \
+              --name project-name-container \
+              --network project-name-net \
+              --env-file /home/ubuntu/app.env \
+              -p 5000:5000 \
+              $IMAGE
+            echo "Using Docker image: $IMAGE"
+
+            echo "⏳ Waiting for container to start..."
+            sleep 10 
+
+            echo "📋 Container status:"
+            sudo docker ps | grep project-name-container || {
+              echo "❌ Container failed to start."
+              exit 1
+            }
+
+            echo "🧽 Cleaning up unused Docker resources..."
+            sudo docker system prune -a -f
+
+      # Slack Notification - Success
+      - name: Notify Slack - Success
+        if: success()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+          --data '{"text":"✅ *Project-Name Pipeline* on the *main branch* executed successfully.\n• Commit: '${GITHUB_SHA::7}'\n• Deployed on: AWS VM."}' \
+          ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      # Slack Notification - Failure
+      - name: Notify Slack - Failure
+        if: failure()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+          --data '{"text":"❌ *Project-Name Pipeline* on the *main branch* execution failed.\n• Commit: '${GITHUB_SHA::7}'"}' \
+          ${{ secrets.SLACK_WEBHOOK_URL }}
