@@ -1,0 +1,81 @@
+﻿name: AWS CodeBuild Deploy Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-west-1
+
+jobs:
+  deploy:
+    name: Trigger AWS CodeBuild and deploy
+    runs-on: ubuntu-latest
+    environment: main
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/project-name-codebuild-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Trigger CodeBuild and wait for completion
+        id: codebuild
+        run: |
+          BUILD_ID=$(aws codebuild start-build \
+            --project-name ${{ secrets.CODEBUILD_PROJECT_NAME }} \
+            --environment-variables-override name=IMAGE_TAG,value=${GITHUB_SHA},type=PLAINTEXT \
+            --query 'build.id' \
+            --output text)
+          echo "Build ID: $BUILD_ID"
+          echo "build_id=$BUILD_ID" >> "$GITHUB_OUTPUT"
+
+          while true; do
+            STATUS=$(aws codebuild batch-get-builds \
+              --ids "$BUILD_ID" \
+              --query 'builds[0].buildStatus' \
+              --output text)
+            echo "Current status: $STATUS"
+            if [ "$STATUS" = "SUCCEEDED" ]; then
+              echo "status=success" >> "$GITHUB_OUTPUT"
+              exit 0
+            elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "FAULT" ] || [ "$STATUS" = "STOPPED" ] || [ "$STATUS" = "TIMED_OUT" ]; then
+              echo "status=failed" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+            sleep 15
+          done
+
+      - name: Notify Slack - Success
+        if: success()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "$(jq -n \
+              --arg sha "${GITHUB_SHA::7}" \
+              --arg actor "${{ github.actor }}" \
+              --arg email "${{ github.event.head_commit.author.email }}" \
+              --arg msg "${{ github.event.head_commit.message }}" \
+              --arg build_id "${{ steps.codebuild.outputs.build_id }}" \
+              '{text: ("✅ *Project-Name CodeBuild pipeline* on *main* succeeded.\n• Commit: " + $sha + "\n• User: " + $actor + "\n• Email: " + $email + "\n• Message: " + $msg + "\n• Build ID: " + $build_id)}')" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+
+      - name: Notify Slack - Failure
+        if: failure()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "$(jq -n \
+              --arg sha "${GITHUB_SHA::7}" \
+              --arg actor "${{ github.actor }}" \
+              --arg email "${{ github.event.head_commit.author.email }}" \
+              --arg msg "${{ github.event.head_commit.message }}" \
+              --arg build_id "${{ steps.codebuild.outputs.build_id }}" \
+              '{text: ("❌ *Project-Name CodeBuild pipeline* on *main* failed.\n• Commit: " + $sha + "\n• User: " + $actor + "\n• Email: " + $email + "\n• Message: " + $msg + "\n• Build ID: " + $build_id)}')" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"

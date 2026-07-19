@@ -1,0 +1,118 @@
+
+version: 0.2
+env:
+  variables:
+    AWS_REGION: "us-west-1"
+phases:
+  install:
+    commands:
+      - echo Ensuring jq is available...
+      - which jq || (apt-get update -y && apt-get install -y jq)
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws --version
+      - |
+        if [ -z "$IMAGE_TAG" ]; then
+          echo "ERROR - IMAGE_TAG is not set. This build must be triggered with an IMAGE_TAG override."
+          exit 1
+        fi
+      - ACCOUNT_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+      - IMAGE_URI=$ACCOUNT_URI/$ECR_REPOSITORY:$IMAGE_TAG
+      - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ACCOUNT_URI
+  build:
+    commands:
+      - |
+        echo "Build started on $(date)"
+      - |
+        docker build \
+          --build-arg DATABASE_URL="$DATABASE_URL" \
+          --build-arg SENTRY_DSN="$SENTRY_DSN" \
+          -t $IMAGE_URI .
+      - echo Pushing image with SHA tag...
+      - docker push $IMAGE_URI
+  post_build:
+    commands:
+      - echo Fetching current task definition...
+      - |
+        CURRENT_TASK_DEF=$(aws ecs describe-task-definition \
+          --task-definition $ECS_TASK_DEF_FAMILY \
+          --query 'taskDefinition' \
+          --output json)
+      - echo Patching container image with new SHA tag...
+      - |
+        NEW_TASK_DEF=$(echo "$CURRENT_TASK_DEF" | jq \
+          --arg IMAGE "$IMAGE_URI" \
+          --arg CONTAINER "$ECS_CONTAINER_NAME" \
+          '(.containerDefinitions[] | select(.name == $CONTAINER)).image = $IMAGE
+           | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+      - echo Registering new task definition revision...
+      - |
+        NEW_TASK_INFO=$(aws ecs register-task-definition \
+          --cli-input-json "$NEW_TASK_DEF")
+      - NEW_REVISION=$(echo "$NEW_TASK_INFO" | jq -r '.taskDefinition.revision')
+      - |
+        echo "Registered new task definition revision - $NEW_REVISION"
+
+      # ---- Gated Prisma migration step via ECS RunTask ----
+      - echo Running Prisma migration as a one-off ECS task...
+      - |
+        MIGRATION_OVERRIDES=$(jq -n \
+          --arg CONTAINER "$ECS_CONTAINER_NAME" \
+          '{
+            containerOverrides: [
+              {
+                name: $CONTAINER,
+                command: ["npx", "prisma", "migrate", "deploy"]
+              }
+            ]
+          }')
+      - |
+        RUN_TASK_OUTPUT=$(aws ecs run-task \
+          --cluster $ECS_CLUSTER_NAME \
+          --task-definition $ECS_TASK_DEF_FAMILY:$NEW_REVISION \
+          --launch-type FARGATE \
+          --network-configuration "awsvpcConfiguration={subnets=[$ECS_SUBNETS],securityGroups=[$ECS_SECURITY_GROUPS],assignPublicIp=$ECS_ASSIGN_PUBLIC_IP}" \
+          --overrides "$MIGRATION_OVERRIDES")
+      - MIGRATION_TASK_ARN=$(echo "$RUN_TASK_OUTPUT" | jq -r '.tasks[0].taskArn')
+      - |
+        if [ -z "$MIGRATION_TASK_ARN" ] || [ "$MIGRATION_TASK_ARN" == "null" ]; then
+          echo "ERROR - Failed to start migration task."
+          echo "$RUN_TASK_OUTPUT"
+          exit 1
+        fi
+      - echo "Migration task started - $MIGRATION_TASK_ARN"
+      - echo Waiting for migration task to stop...
+      - |
+        aws ecs wait tasks-stopped \
+          --cluster $ECS_CLUSTER_NAME \
+          --tasks "$MIGRATION_TASK_ARN"
+      - |
+        MIGRATION_TASK_DESC=$(aws ecs describe-tasks \
+          --cluster $ECS_CLUSTER_NAME \
+          --tasks "$MIGRATION_TASK_ARN")
+      - |
+        EXIT_CODE=$(echo "$MIGRATION_TASK_DESC" | jq -r \
+          --arg CONTAINER "$ECS_CONTAINER_NAME" \
+          '.tasks[0].containers[] | select(.name == $CONTAINER) | .exitCode')
+      - |
+        STOPPED_REASON=$(echo "$MIGRATION_TASK_DESC" | jq -r '.tasks[0].stoppedReason')
+      - |
+        if [ "$EXIT_CODE" != "0" ]; then
+          echo "ERROR - Migration task failed with exit code $EXIT_CODE"
+          echo "Stopped reason - $STOPPED_REASON"
+          exit 1
+        fi
+      - echo "Migration completed successfully."
+      # ---- End gated migration step ----
+
+      - |
+        aws ecs update-service \
+          --cluster $ECS_CLUSTER_NAME \
+          --service $ECS_SERVICE_NAME \
+          --task-definition $ECS_TASK_DEF_FAMILY:$NEW_REVISION \
+          --force-new-deployment
+      - |
+        aws ecs wait services-stable \
+          --cluster $ECS_CLUSTER_NAME \
+          --services $ECS_SERVICE_NAME
