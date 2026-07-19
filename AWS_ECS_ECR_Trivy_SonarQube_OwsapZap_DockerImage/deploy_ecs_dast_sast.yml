@@ -1,0 +1,519 @@
+name: deploy project-name backend to ECS
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ecs-deploy-main
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-west-1
+
+jobs:
+  # ------------------------------------------------------
+  # JOB 1: SonarQube Code Quality Gate
+  # ------------------------------------------------------
+  sonarqube:
+    name: SonarQube Scan
+    runs-on: ubuntu-latest
+    environment: main
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: '10'
+          run_install: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm exec prisma generate
+
+      - name: Generate coverage report
+        run: pnpm exec jest --config=jest.config.js --passWithNoTests --coverage
+
+      - name: SonarQube Scan & Quality Gate
+        id: sonar
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}
+            -Dsonar.qualitygate.wait=true
+      - name: Notify Slack - SonarQube Failed
+        if: failure()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "$(jq -n \
+              --arg sha "${{ github.sha }}" \
+              --arg actor "${{ github.actor }}" \
+              --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '{text: ("🔴 *SonarQube Quality Gate FAILED*\n• Commit: " + $sha + "\n• User: " + $actor + "\n• Run: " + $run_url)}')" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+      - name: Notify Slack - SonarQube Passed
+        if: success()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "$(jq -n \
+              --arg sha "${{ github.sha }}" \
+              --arg actor "${{ github.actor }}" \
+              --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '{text: ("✅ *SonarQube Quality Gate PASSED*\n• Commit: " + $sha + "\n• User: " + $actor + "\n• Run: " + $run_url)}')" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+  # ------------------------------------------------------
+  # JOB 2: Build and Push to ECR
+  # ------------------------------------------------------
+  build:
+    name: Build and Push to ECR
+    runs-on: ubuntu-latest
+    needs: sonarqube
+    environment: main
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image_tag: ${{ steps.outputs.outputs.image_tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC Role)
+        uses: aws-actions/configure-aws-credentials@v4.2.1
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/project-name-main-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION \
+            | docker login --username AWS --password-stdin \
+              ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com
+      - name: Build and Push Docker image
+        id: build
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          ACCOUNT_ID=$(echo -n "${{ secrets.AWS_ACCOUNT_ID }}" | tr -d '\r\n')
+          REPO=$(echo -n "${{ secrets.ECR_REPOSITORY }}" | tr -d '\r\n')
+          IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO}:${IMAGE_TAG}"
+          echo "Building image: $IMAGE_URI"
+          docker build \
+            --build-arg COMMIT_SHA=$IMAGE_TAG \
+            --build-arg SENTRY_DSN=${{ secrets.SENTRY_DSN }} \
+            -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "Successfully pushed: $IMAGE_URI"
+          # Persist across steps in this job (fine locally, never crosses job boundary)
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+      - name: Export Outputs
+        id: outputs
+        run: |
+          if [ -z "$IMAGE_TAG" ]; then
+            echo "❌ IMAGE_TAG is empty, refusing to export outputs."
+            exit 1
+          fi
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+      - name: Notify Slack - Build Failed
+        if: failure()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "$(jq -n \
+              --arg sha "${{ github.sha }}" \
+              --arg actor "${{ github.actor }}" \
+              --arg msg "${{ github.event.head_commit.message }}" \
+              '{text: ("🔴 *Build & Push FAILED* on *main branch*.\n• Commit: " + $sha + "\n• User: " + $actor + "\n• Message: " + $msg)}')" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+  # ------------------------------------------------------
+  # JOB 3: Trivy Image Security Scan
+  # ------------------------------------------------------
+  trivy:
+    name: Trivy Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    environment: main
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials (OIDC Role)
+        uses: aws-actions/configure-aws-credentials@v4.2.1
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/project-name-main-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION \
+            | docker login \
+                --username AWS \
+                --password-stdin \
+                ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.$AWS_REGION.amazonaws.com
+      - name: Verify Image Exists in ECR
+        run: |
+          if [ -z "${{ needs.build.outputs.image_tag }}" ]; then
+            echo "❌ image_tag output is empty."
+            exit 1
+          fi
+          aws ecr describe-images \
+            --repository-name ${{ secrets.ECR_REPOSITORY }} \
+            --image-ids imageTag=${{ needs.build.outputs.image_tag }}
+      - name: Pull Docker Image
+        run: |
+          docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:${{ needs.build.outputs.image_tag }}
+      - name: Run Trivy Security Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          scan-ref: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:${{ needs.build.outputs.image_tag }}
+          format: table
+          output: project-name-trivy.txt
+          ignore-unfixed: true
+          exit-code: '0'
+          vuln-type: library
+
+      - name: Upload Trivy Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: project-name-trivy.txt
+
+      - name: Notify Slack - Trivy Report Ready
+        if: always()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "$(jq -n \
+              --arg sha "${{ github.sha }}" \
+              --arg actor "${{ github.actor }}" \
+              --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '{text: ("🔍 *Trivy Security Scan complete* on *main branch*.\n• Commit: " + $sha + "\n• User: " + $actor + "\n• Report: " + $run_url)}')" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+  # ------------------------------------------------------
+  # JOB 4: Register new ECS task definition revision pointing at the
+  # ------------------------------------------------------
+  register-task-def:
+    name: Register Task Definition (SHA image)
+    runs-on: ubuntu-latest
+    needs: [build, trivy]
+    environment: main
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      task_def_revision: ${{ steps.register.outputs.task_def_revision }}
+
+    steps:
+      - name: Configure AWS credentials (OIDC Role)
+        uses: aws-actions/configure-aws-credentials@v4.2.1
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/project-name-main-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set Image URI
+        id: image
+        run: |
+          ACCOUNT_ID=$(echo -n "${{ secrets.AWS_ACCOUNT_ID }}" | tr -d '\r\n')
+          REPO=$(echo -n "${{ secrets.ECR_REPOSITORY }}" | tr -d '\r\n')
+          IMAGE_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO}:${{ needs.build.outputs.image_tag }}"
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+      - name: Fetch current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ secrets.ECS_TASK_DEFINITION_FAMILY }} \
+            --query "taskDefinition" \
+            --output json > task-def.json
+      - name: Update image and strip non-registrable fields
+        run: |
+          jq --arg IMAGE "${{ steps.image.outputs.image_uri }}" \
+             --arg NAME "${{ secrets.ECS_CONTAINER_NAME }}" \
+            '.containerDefinitions = (.containerDefinitions | map(
+                if .name == $NAME then .image = $IMAGE else . end
+              ))
+             | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                   .compatibilities, .registeredAt, .registeredBy)' \
+            task-def.json > new-task-def.json
+      - name: Register new task definition revision
+        id: register
+        run: |
+          NEW_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-def.json \
+            --query "taskDefinition.taskDefinitionArn" \
+            --output text)
+          echo "Registered new task definition: $NEW_ARN"
+
+          # Only the bare revision number crosses the job boundary —
+          # the full ARN contains the AWS account ID and gets
+          # silently blanked by GitHub Actions' secret masking.
+          REVISION=$(aws ecs describe-task-definition \
+            --task-definition "$NEW_ARN" \
+            --query "taskDefinition.revision" \
+            --output text)
+
+          if [ -z "$REVISION" ] || [ "$REVISION" = "None" ]; then
+            echo "❌ Could not resolve task definition revision, refusing to export outputs."
+            exit 1
+          fi
+
+          echo "Resolved revision: $REVISION"
+          echo "task_def_revision=$REVISION" >> "$GITHUB_OUTPUT"
+  # ------------------------------------------------------
+  # JOB 5: Run Prisma Migrations
+  # ------------------------------------------------------
+  migrate:
+    name: Run Prisma Migrations
+    runs-on: ubuntu-latest
+    needs: [build, register-task-def]
+    environment: main
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials (OIDC Role)
+        uses: aws-actions/configure-aws-credentials@v4.2.1
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/project-name-main-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run Prisma migrate deploy via ECS RunTask
+        id: run_migration
+        run: |
+          if [ -z "${{ needs.register-task-def.outputs.task_def_revision }}" ]; then
+            echo "❌ task_def_revision output is empty."
+            exit 1
+          fi
+
+          TASK_DEF="${{ secrets.ECS_TASK_DEFINITION_FAMILY }}:${{ needs.register-task-def.outputs.task_def_revision }}"
+          echo "Using task definition: $TASK_DEF"
+
+          TASK_ARN=$(aws ecs run-task \
+            --cluster ${{ secrets.ECS_CLUSTER_NAME }} \
+            --task-definition "$TASK_DEF" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={
+              subnets=[${{ secrets.ECS_SUBNET_IDS }}],
+              securityGroups=[${{ secrets.ECS_SECURITY_GROUP_IDS }}],
+              assignPublicIp=ENABLED
+            }" \
+            --overrides "$(jq -n \
+              --arg container "${{ secrets.ECS_CONTAINER_NAME }}" \
+              --arg db_url "${{ secrets.DATABASE_URL }}" \
+              '{
+                containerOverrides: [{
+                  name: $container,
+                  command: ["node_modules/.bin/prisma", "migrate", "deploy"],
+                  environment: [{
+                    name: "DATABASE_URL",
+                    value: $db_url
+                  }]
+                }]
+              }')" \
+            --query "tasks[0].taskArn" \
+            --output text)
+          echo "Migration task ARN: $TASK_ARN"
+          echo "task_arn=$TASK_ARN" >> $GITHUB_OUTPUT
+      - name: Wait for migration task to complete
+        run: |
+          echo "Waiting for migration task to finish..."
+          aws ecs wait tasks-stopped \
+            --cluster ${{ secrets.ECS_CLUSTER_NAME }} \
+            --tasks ${{ steps.run_migration.outputs.task_arn }}
+      - name: Check migration exit code
+        run: |
+          TASK_DETAIL=$(aws ecs describe-tasks \
+            --cluster ${{ secrets.ECS_CLUSTER_NAME }} \
+            --tasks ${{ steps.run_migration.outputs.task_arn }})
+          echo "=== Full task detail ==="
+          echo "$TASK_DETAIL" | jq .
+          LAST_STATUS=$(echo "$TASK_DETAIL" | jq -r '.tasks[0].lastStatus')
+          STOPPED_REASON=$(echo "$TASK_DETAIL" | jq -r '.tasks[0].stoppedReason')
+          EXIT_CODE=$(echo "$TASK_DETAIL" | jq -r '.tasks[0].containers[0].exitCode')
+          CONTAINER_REASON=$(echo "$TASK_DETAIL" | jq -r '.tasks[0].containers[0].reason')
+          echo "=== Summary ==="
+          echo "Last status:      $LAST_STATUS"
+          echo "Stopped reason:   $STOPPED_REASON"
+          echo "Container reason: $CONTAINER_REASON"
+          echo "Exit code:        $EXIT_CODE"
+          if [ "$EXIT_CODE" = "null" ] || [ "$EXIT_CODE" != "0" ]; then
+            echo "❌ Migration failed — exit code: $EXIT_CODE"
+            echo "❌ Stopped reason: $STOPPED_REASON"
+            echo "❌ Container reason: $CONTAINER_REASON"
+            exit 1
+          fi
+          echo "✅ Migration completed successfully"
+      - name: Print migration container logs
+        if: failure()
+        run: |
+          TASK_ARN="${{ steps.run_migration.outputs.task_arn }}"
+          TASK_ID=$(basename "$TASK_ARN")
+
+          TASK_DEF="${{ secrets.ECS_TASK_DEFINITION_FAMILY }}:${{ needs.register-task-def.outputs.task_def_revision }}"
+
+          LOG_CONFIG=$(aws ecs describe-task-definition \
+            --task-definition "$TASK_DEF" \
+            --query "taskDefinition.containerDefinitions[0].logConfiguration.options" \
+            --output json)
+
+          LOG_GROUP=$(echo "$LOG_CONFIG" | jq -r '."awslogs-group"')
+          LOG_PREFIX=$(echo "$LOG_CONFIG" | jq -r '."awslogs-stream-prefix"')
+          LOG_STREAM="${LOG_PREFIX}/${{ secrets.ECS_CONTAINER_NAME }}/${TASK_ID}"
+
+          echo "=== Migration container logs (${LOG_GROUP} / ${LOG_STREAM}) ==="
+          aws logs get-log-events \
+            --log-group-name "$LOG_GROUP" \
+            --log-stream-name "$LOG_STREAM" \
+            --query "events[*].message" \
+            --output text || echo "⚠️ Could not fetch logs — check log group/stream naming manually."
+      - name: Notify Slack - Migration Failed
+        if: failure()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "$(jq -n \
+              --arg sha "${{ github.sha }}" \
+              --arg actor "${{ github.actor }}" \
+              --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '{text: ("🔴 *Prisma Migration FAILED* on *main branch*.\n• Commit: " + $sha + "\n• User: " + $actor + "\n• Run: " + $run_url)}')" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+      - name: Notify Slack - Migration Passed
+        if: success()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "$(jq -n \
+              --arg sha "${{ github.sha }}" \
+              --arg actor "${{ github.actor }}" \
+              '{text: ("✅ *Prisma Migration PASSED* on *main branch*.\n• Commit: " + $sha + "\n• User: " + $actor)}')" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+  # ------------------------------------------------------
+  # JOB 6: Deploy to ECS
+  # ------------------------------------------------------
+  deploy:
+    name: Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: [register-task-def, migrate]
+    environment: main
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials (OIDC Role)
+        uses: aws-actions/configure-aws-credentials@v4.2.1
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/project-name-main-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Debug AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Deploy new task definition revision to ECS service
+        run: |
+          if [ -z "${{ needs.register-task-def.outputs.task_def_revision }}" ]; then
+            echo "❌ task_def_revision output is empty."
+            exit 1
+          fi
+
+          TASK_DEF="${{ secrets.ECS_TASK_DEFINITION_FAMILY }}:${{ needs.register-task-def.outputs.task_def_revision }}"
+          echo "Deploying task definition: $TASK_DEF"
+
+          aws ecs update-service \
+            --cluster ${{ secrets.ECS_CLUSTER_NAME }} \
+            --service ${{ secrets.ECS_SERVICE_NAME }} \
+            --task-definition "$TASK_DEF" \
+            --force-new-deployment
+      - name: Wait for deployment to complete
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ secrets.ECS_CLUSTER_NAME }} \
+            --services ${{ secrets.ECS_SERVICE_NAME }}
+          echo "Deployment completed successfully!"
+      - name: Verify deployment
+        run: |
+          aws ecs describe-services \
+            --cluster ${{ secrets.ECS_CLUSTER_NAME }} \
+            --services ${{ secrets.ECS_SERVICE_NAME }} \
+            --query "services[0].deployments[?status=='PRIMARY'].{Status:status,TaskDefinition:taskDefinition,DesiredCount:desiredCount,RunningCount:runningCount}" \
+            --output table
+      - name: Notify Slack - Success
+        if: success()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "$(jq -n \
+              --arg sha "${{ github.sha }}" \
+              --arg actor "${{ github.actor }}" \
+              --arg email "${{ github.event.head_commit.author.email }}" \
+              --arg msg "${{ github.event.head_commit.message }}" \
+              '{text: ("✅ *Project-Name Backend* deployed to *main* successfully.\n• Commit: " + $sha + "\n• User: " + $actor + "\n• Email: " + $email + "\n• Message: " + $msg)}')" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+      - name: Notify Slack - Failure
+        if: failure()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "$(jq -n \
+              --arg sha "${{ github.sha }}" \
+              --arg actor "${{ github.actor }}" \
+              --arg email "${{ github.event.head_commit.author.email }}" \
+              '{text: ("❌ *Project-Name Backend* deploy to *main* FAILED.\n• Commit: " + $sha + "\n• User: " + $actor + "\n• Email: " + $email)}')" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
+  # ------------------------------------------------------
+  # JOB 7: OWASP ZAP DAST Scan
+  # ------------------------------------------------------
+  zap-scan:
+    name: OWASP ZAP Baseline Scan
+    runs-on: ubuntu-latest
+    needs: deploy
+    environment: main
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Fix workspace permissions for ZAP
+        run: chmod -R 777 ${{ github.workspace }}
+
+      - name: ZAP Baseline Scan
+        id: zap
+        continue-on-error: true
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: ${{ secrets.APP_URL }}
+          cmd_options: '-a'
+          fail_action: false
+          allow_issue_writing: false
+
+      - name: Notify Slack - ZAP Scan Complete
+        if: always()
+        run: |
+          curl -X POST -H 'Content-type: application/json' \
+            --data "$(jq -n \
+              --arg sha "${{ github.sha }}" \
+              --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              '{text: ("⚡ *Project-Name Backend ZAP Scan* completed on *main branch*.\n• Commit: " + $sha + "\n• Results: " + $run_url)}')" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
