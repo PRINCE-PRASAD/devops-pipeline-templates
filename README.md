@@ -13,6 +13,9 @@ A collection of reusable GitHub Actions and CI/CD pipeline templates for AWS, Ve
 - [EC2 Docker deployment with DockerHub](EC2_DockerImage_DockerHub_GithubAction/readme.md)
   - Builds a Docker image and deploys it to an AWS EC2 instance using DockerHub and GitHub Actions.
 
+- [AWS CodeBuild deployment pipeline](AWS_ECS_ECR_CodeBuild_GithubAction_DockerImage/readme.md)
+  - Triggers an AWS CodeBuild project from GitHub Actions, then waits for the CodeBuild run to complete.
+
 - [Vercel UI deployment using Vercel token](Vercel_UI_Pipline_using_Vercel_Token/readme.md)
   - Deploys a frontend app to Vercel using a Vercel API token.
 
